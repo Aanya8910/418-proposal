@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>In-Pass Draft Truncation for MoE Speculative Decoding</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+         max-width: 760px; margin: 40px auto; padding: 0 16px; line-height: 1.55; color: #1f2328; }
+  h1 { font-size: 1.6em; margin-bottom: 0.2em; }
+  .team { color: #555; margin-top: 0; }
+  h2 { font-size: 1.15em; margin-top: 1.8em; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  ul { padding-left: 1.2em; }
+  .pending { color: #888; }
+</style>
+</head>
+<body>
+  <h1>Cutting the Verify: In-Pass Draft Truncation for Mixture-of-Experts Speculative Decoding</h1>
+  <p class="team">Anya Shankar (anyashan) &middot; Aanya Kochhar (aanyak) &middot; 15-418, Fall 2026</p>
+
+  <h2>Summary</h2>
+  <p>We will make speculative-decoding verification cheaper for Mixture-of-Experts (MoE) models by deciding
+  during the forward pass, layer by layer, which trailing draft rows are worth the extra expert-weight traffic
+  they cause. We will implement this as a fused, lock-free MoE kernel in Metal on a 32-core M5 Max GPU,
+  comparing three schemes for synchronizing threadgroups across phases, and run memory-consistency litmus
+  tests on the same GPU.</p>
+
+  <h2>Reports</h2>
+  <ul>
+    <li><a href="proposal.pdf">Project Proposal</a> (Nov 9)</li>
+    <li class="pending">Milestone Report (due Nov 23)</li>
+    <li class="pending">Final Report (due Dec 10)</li>
+  </ul>
+</body>
+</html>
