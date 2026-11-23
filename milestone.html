@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milestone Report: Cutting the Verify</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+         max-width: 860px; margin: 40px auto; padding: 0 16px; line-height: 1.55; color: #1f2328; }
+  h1 { font-size: 1.6em; margin-bottom: 0.2em; }
+  .team { color: #555; margin-top: 0; }
+  .nav { font-size: 0.95em; margin: 0.6em 0 1.4em; }
+  h2 { font-size: 1.15em; margin-top: 1.8em; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  ul, ol { padding-left: 1.4em; }
+  table { border-collapse: collapse; margin: 0.8em 0 1.2em; font-size: 0.92em; width: 100%; }
+  th, td { border: 1px solid #d0d7de; padding: 5px 8px; text-align: left; vertical-align: top; }
+  th { background: #f6f8fa; }
+</style>
+</head>
+<body>
+  <h1>Milestone Report</h1>
+  <p class="team">Cutting the Verify: In-Pass Draft Truncation for Mixture-of-Experts Speculative Decoding<br>
+  Anya Shankar (anyashan) &middot; Aanya Kochhar (aanyak) &middot; 15-418, Fall 2026 &middot; Nov 23, 2026</p>
+  <p class="nav"><a href="index.html">&larr; Project home</a> &middot; <a href="proposal.html">Proposal</a> &middot; <a href="milestone.pdf" download="418-milestone.pdf">Download PDF</a></p>
+<h2>1  Summary of Work So Far</h2>
+<p>Our week-1 go/no-go check came back <strong>no-go</strong>: in-pass draft truncation cannot beat a pre-pass rule, on either model we measured. We built a speculative decoding pipeline in MLX that logs, for every verify pass, which experts each row selects in every MoE layer, then replayed 2,442 logged verify rounds (1,036 on Granite-3.1-3B-A800M, 1,406 on Qwen3-30B-A3B) under several cut policies with a measured cost model. Even with perfect knowledge of each round's routing, deciding during the pass beats the EVICT-style pre-pass rule by only −0.1% (Granite) and +0.2% (Qwen), against our 5% threshold. The measurements also show why, and point to a better target. In MLX's stock MoE kernel (gather_qmm), verify cost tracks (row, expert) pairs rather than distinct experts: rows that all pick the same experts cost as much as rows that pick different ones, and verifying 8 rows costs 3.24× one row on Qwen. Under that cost, speculative decoding is a net loss on both models (0.35–0.98× of plain decoding).<br />
+We therefore take the fallback named in our proposal (cost model, pre-pass rule, and the fused Metal kernel with the synchronization and memory-consistency study), with a measured goal for the kernel: make MoE verify cost follow distinct experts. The pre-pass rule now runs inside mlx-lm: drafting stops early on low confidence and a cost-aware cut chooses how many drafts to verify, which gives +13% tokens/s over verifying all drafts on Granite. Kept rows of a truncated verify are bit-identical to the full pass for any pre-pass cut on Granite (always at least 2 rows), and for cuts of at least five rows on Qwen. Metal litmus tests show that cross-threadgroup handoffs need a device-scope fence. On an NCSA Delta A100, the CUDA trace replay matches MLX's float32 expert outputs on both models, and CUDA litmus tests show the same need for device-scope ordering between thread blocks. The MLX C++/Metal extension skeleton builds and passes its CPU and GPU tests. The fused kernel's design is fixed; implementation starts this week.</p>
+<h2>2  Changes Since the Proposal</h2>
+<blockquote>
+<ul>
+<li><strong>Model:</strong> Granite-3.1-3B-A800M (target) with Granite-3.1-1B-A400M (draft), as recommended. We also ran Qwen3-30B-A3B with Qwen3-0.6B as a second data point for the go/no-go measurement only, to test whether the result was specific to Granite's 40 experts.  </li>
+<li><strong>Quantization:</strong> after mlx_lm.convert -q --q-bits 4, Granite's expert gate and up projections are 4-bit but its down projection is 8-bit (mlx-lm's recipe for this model). The kernels must handle both widths.  </li>
+<li><strong>Synchronization variants:</strong> reduced from three to two (a global barrier and per-tile readiness flags), so the fused kernel gets the time it now needs as the main deliverable.  </li>
+<li><strong>CUDA machine:</strong> PSC Bridges-2 has been offline since Nov 9 for its data-center move (expected back around December). Our CUDA work moved to NCSA Delta (A100-SXM4-40GB, sm_80, CUDA 13.2) on our ACCESS allocation, where the trace replay and litmus tests now run.</li>
+</ul>
+</blockquote>
+<h2>3  Progress Against Goals and Deliverables</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Proposal goal</th>
+<th style="text-align: left;">Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Cost model of verify cost vs. experts read (draft lengths 1–8)</td>
+<td style="text-align: left;"><strong>Done</strong> on both models (Aanya)</td>
+</tr>
+<tr>
+<td style="text-align: left;">MLX baseline of in-pass truncation; fixed-length and pre-pass comparison policies</td>
+<td style="text-align: left;">Policy comparison <strong>done</strong> by trace replay (Aanya). Pre-pass rule <strong>running in mlx-lm</strong> (draft-stop and draft-cut hooks): +13% tokens/s over verifying all drafts on Granite, still 0.52× plain decoding (base M5) (Anya)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Kept rows bit-identical to an untruncated pass</td>
+<td style="text-align: left;"><strong>Done</strong> on both models (Anya). Granite: identical for any cut of at least 2 rows (162/168 rows; only the 1-row pass differs). Qwen: identical only for cuts of at least 5 rows (54/84; rows 1–4 differ by up to 2.7 logits). Greedy token agreed in every row on both models</td>
+</tr>
+<tr>
+<td style="text-align: left;">Week-1 go/no-go</td>
+<td style="text-align: left;"><strong>Done: no-go</strong> on both models (Aanya)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Fused single-dispatch Metal MoE kernel</td>
+<td style="text-align: left;">Design fixed (see Revised Goals); MLX C++/Metal extension skeleton <strong>builds and passes</strong> CPU and GPU tests. Kernel implementation starts this week (Anya)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Three synchronization variants</td>
+<td style="text-align: left;">Reduced to two (global barrier, per-tile readiness flags). Not started (Anya)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Metal litmus tests</td>
+<td style="text-align: left;"><strong>Done on the base M5</strong> (Anya): 32.8M instances per test. Message passing, store buffering and load buffering all weak without a fence (0.2–0.6%), never with a device-scope fence (95% bound &lt; 1e-7). M5 Max run pending</td>
+</tr>
+<tr>
+<td style="text-align: left;">CUDA trace format, replay harness, litmus tests (stretch)</td>
+<td style="text-align: left;">Trace format and replay harness <strong>done</strong>; on an NCSA Delta A100 the replay passes 27/27 checks on both the Granite and Qwen traces, and all 15 litmus test variants ran (Aanya)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Do we still expect to deliver?</strong> The measurement study is complete. In-pass truncation is dropped as a performance goal but kept as a reported analysis result. Whether the fused kernel meets the target below depends on the kernel, whose design is fixed and whose implementation starts this week, global-barrier version first. The CUDA replay and litmus tests are done; the Metal-vs-CUDA comparison remains a stretch goal.</p>
+<h2>4  Revised Goals for the Poster Session</h2>
+<p><strong>Plan to achieve</strong></p>
+<blockquote>
+<ol>
+<li>Measurement study on two MoE models: verify cost vs. rows, expert-union statistics, the per-pair cost of MLX's expert kernel, and the go/no-go replay (done).  </li>
+<li>Pre-pass, cost-aware truncation evaluated against fixed draft lengths (done in replay: +25% tokens/ms over verifying all rows on Qwen; running in mlx-lm: +13% tokens/s on Granite).  </li>
+<li>A fused Metal MoE kernel whose cost follows <em>distinct</em> experts, reading each selected expert once for all rows that chose it, correct against the trace's float32 reference and handling mixed 4/8-bit weights. <strong>Target:</strong> 8-row expert time on Qwen of about 20 ms, down from 35.8 ms. Justification: streaming the 3,737 MiB of distinct experts at the 198 GB/s MLX already achieves for one row takes about 20 ms. Design: one threadgroup per (distinct expert, output tile) loads that tile of the expert's weights once and applies it to every row that selected the expert. It uses MLX's quantized weight layout as-is (group size 64; 4-bit gate and up projections, 8-bit down), so no repacking.  </li>
+<li>Two synchronization schemes for that kernel, with measured overhead per layer. An elected producer writes the task table (distinct experts and their row lists) to coherent memory; consumers wait either at a global barrier or on per-tile readiness flags. Both use the device-scope fence the litmus tests show is required.  </li>
+<li>Memory-consistency litmus tests on Apple GPUs (done on the base M5; M5 Max run pending).</li>
+</ol>
+</blockquote>
+<p><strong>Hope to achieve</strong></p>
+<blockquote>
+<ol>
+<li>End-to-end speculative decoding with the fused kernel faster than plain decoding on at least one model.  </li>
+<li>A Metal-vs-CUDA comparison of the litmus results (the CUDA runs on a Delta A100 are done).</li>
+</ol>
+</blockquote>
+<h2>5  Preliminary Results</h2>
+<p>Setup for results 1–6: 32-core M5 Max, MLX 0.32.4, mlx-lm 0.32.2, greedy decoding, 7 drafts per round, 16 prompts × 256 tokens. Verify timings are medians of 15 runs on 6 real contexts. Results 7–9 ran on a base M5 (10-core GPU); result 10 ran on an NCSA Delta A100.<br />
+<strong>1. Verifying more rows is expensive for MoE models.</strong> A dense model costs about 1.12× at 8 rows (the figure cited in our proposal).</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Rows</th>
+<th style="text-align: left;">Granite verify (ms)</th>
+<th style="text-align: left;">vs 1 row</th>
+<th style="text-align: left;">Qwen verify (ms)</th>
+<th style="text-align: left;">vs 1 row</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">1</td>
+<td style="text-align: left;">4.56</td>
+<td style="text-align: left;">1.00×</td>
+<td style="text-align: left;">12.35</td>
+<td style="text-align: left;">1.00×</td>
+</tr>
+<tr>
+<td style="text-align: left;">2</td>
+<td style="text-align: left;">5.63</td>
+<td style="text-align: left;">1.23×</td>
+<td style="text-align: left;">17.09</td>
+<td style="text-align: left;">1.38×</td>
+</tr>
+<tr>
+<td style="text-align: left;">4</td>
+<td style="text-align: left;">7.32</td>
+<td style="text-align: left;">1.60×</td>
+<td style="text-align: left;">25.80</td>
+<td style="text-align: left;">2.09×</td>
+</tr>
+<tr>
+<td style="text-align: left;">6</td>
+<td style="text-align: left;">8.77</td>
+<td style="text-align: left;">1.92×</td>
+<td style="text-align: left;">35.48</td>
+<td style="text-align: left;">2.87×</td>
+</tr>
+<tr>
+<td style="text-align: left;">8</td>
+<td style="text-align: left;">9.80</td>
+<td style="text-align: left;">2.15×</td>
+<td style="text-align: left;">40.04</td>
+<td style="text-align: left;">3.24×</td>
+</tr>
+</tbody>
+</table>
+<p><strong>2. MLX's expert kernel charges per (row, expert) pair, not per distinct expert.</strong> On Qwen, expert time grows 6.9× from 1 to 8 rows (5.16 → 35.81 ms) while distinct experts grow 3.8× (384 → 1,476 across 48 layers), and effective bandwidth falls from 198 to 109 GB/s (Granite: 285 → 215 GB/s). A single-layer test isolates it: with the same number of (row, expert) pairs, rows that all pick the same 8 experts cost the same as rows that pick different experts.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Rows</th>
+<th style="text-align: left;">Qwen: same 8 experts (ms)</th>
+<th style="text-align: left;">Qwen: all distinct (ms)</th>
+<th style="text-align: left;">Granite: same 8 experts (ms)</th>
+<th style="text-align: left;">Granite: all distinct (ms)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">1</td>
+<td style="text-align: left;">0.329</td>
+<td style="text-align: left;">0.320</td>
+<td style="text-align: left;">0.244</td>
+<td style="text-align: left;">0.239</td>
+</tr>
+<tr>
+<td style="text-align: left;">4</td>
+<td style="text-align: left;">0.676</td>
+<td style="text-align: left;">0.624</td>
+<td style="text-align: left;">0.300</td>
+<td style="text-align: left;">0.362</td>
+</tr>
+<tr>
+<td style="text-align: left;">8</td>
+<td style="text-align: left;">0.948</td>
+<td style="text-align: left;">0.945</td>
+<td style="text-align: left;">0.376</td>
+<td style="text-align: left;">0.442</td>
+</tr>
+</tbody>
+</table>
+<p>On Qwen, reusing experts gives no saving at all. On Granite it saves at most about 20%. Our data shows the cost but not its mechanism (re-reading weights from memory versus per-pair overhead).<br />
+<strong>3. Expert usage barely varies between rounds, so routing information cannot improve the cut.</strong></p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;"></th>
+<th style="text-align: left;">Granite</th>
+<th style="text-align: left;">Qwen</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Experts per layer, top-k</td>
+<td style="text-align: left;">40, top-8</td>
+<td style="text-align: left;">128, top-8</td>
+</tr>
+<tr>
+<td style="text-align: left;">Distinct experts per layer at 8 rows (no-overlap ceiling 64)</td>
+<td style="text-align: left;">24.4</td>
+<td style="text-align: left;">28.5</td>
+</tr>
+<tr>
+<td style="text-align: left;">Total experts read at 8 rows, mean ± sd</td>
+<td style="text-align: left;">780 ± 46</td>
+<td style="text-align: left;">1,369 ± 158</td>
+</tr>
+<tr>
+<td style="text-align: left;">Coefficient of variation across rounds</td>
+<td style="text-align: left;">0.059</td>
+<td style="text-align: left;">0.116</td>
+</tr>
+<tr>
+<td style="text-align: left;">Mean accepted drafts (of 7)</td>
+<td style="text-align: left;">2.97</td>
+<td style="text-align: left;">1.92</td>
+</tr>
+</tbody>
+</table>
+<p><strong>4. Go/no-go: cut policies replayed on logged rounds</strong> (tokens per ms including draft time, relative to pre-pass). "In-pass@l" decides after seeing the first l MoE layers' routing; the oracle knows the round's full routing in advance.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Policy</th>
+<th style="text-align: left;">Granite</th>
+<th style="text-align: left;">Qwen</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Verify all rows</td>
+<td style="text-align: left;">−1.4%</td>
+<td style="text-align: left;">−19.8%</td>
+</tr>
+<tr>
+<td style="text-align: left;">Best fixed row count</td>
+<td style="text-align: left;">−1.4%</td>
+<td style="text-align: left;">−12.1%</td>
+</tr>
+<tr>
+<td style="text-align: left;">Pre-pass (EVICT-style)</td>
+<td style="text-align: left;">0.0%</td>
+<td style="text-align: left;">0.0%</td>
+</tr>
+<tr>
+<td style="text-align: left;">In-pass, oracle</td>
+<td style="text-align: left;">−0.1%</td>
+<td style="text-align: left;">+0.2%</td>
+</tr>
+<tr>
+<td style="text-align: left;">In-pass@1</td>
+<td style="text-align: left;">−0.2%</td>
+<td style="text-align: left;">−1.0%</td>
+</tr>
+<tr>
+<td style="text-align: left;">In-pass@4</td>
+<td style="text-align: left;">−0.4%</td>
+<td style="text-align: left;">−3.3%</td>
+</tr>
+<tr>
+<td style="text-align: left;">In-pass@16 (Granite) / @24 (Qwen)</td>
+<td style="text-align: left;">−1.1%</td>
+<td style="text-align: left;">−14.6%</td>
+</tr>
+</tbody>
+</table>
+<p>The cut is decided mainly by acceptance probability (from 8% to 94% per draft), which a pre-pass rule already uses. A round's cost differs from the average by only a few percent. Deciding mid-pass also forces the early layers to run with every row, so later decision points are strictly worse. Early-layer routing does correlate with later-layer traffic (0.36–0.80), but with so little variance this does not help. Expected accepted tokens use draft probabilities calibrated to observed acceptance, fit and scored on separate halves of the prompts; raw draft probabilities give the same conclusion. Acceptance signals do no better. In a separate replay of 1,507 Qwen rounds, knowing at layer 6 exactly which drafts will be rejected would gain 13.5% over pre-pass, falling below 5% by layer 36. But neither a logit lens nor a probe trained on intermediate hidden states predicts rejection better than the draft probability the pre-pass rule already uses (held-out AUC 0.82–0.83 against 0.83), and the resulting in-pass policies score between −1.2% and 0.0%.<br />
+<strong>5. Speculative decoding is currently a net loss on both models.</strong></p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;"></th>
+<th style="text-align: left;">Granite</th>
+<th style="text-align: left;">Qwen</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Plain greedy (tokens/s)</td>
+<td style="text-align: left;">213–232</td>
+<td style="text-align: left;">95–115</td>
+</tr>
+<tr>
+<td style="text-align: left;">Speculative, 7 drafts (tokens/s)</td>
+<td style="text-align: left;">96–181</td>
+<td style="text-align: left;">40–110</td>
+</tr>
+<tr>
+<td style="text-align: left;">Speedup</td>
+<td style="text-align: left;">0.43–0.81×</td>
+<td style="text-align: left;">0.35–0.98×</td>
+</tr>
+<tr>
+<td style="text-align: left;">Main cause</td>
+<td style="text-align: left;">Drafting is 64% of each round (18.0 ms drafting vs 10.1 ms verifying): the MoE draft costs about 56% of the target per token</td>
+<td style="text-align: left;">Each extra verify row costs about 2.9 ms (about 24% of a full decode step), and acceptance is low</td>
+</tr>
+</tbody>
+</table>
+<p><strong>6. Trace replay validated on an A100.</strong> On an NCSA Delta A100 (sm_80), the CUDA replay harness reproduces MLX's float32 expert outputs on both real traces: 27/27 checks on Granite and 27/27 on Qwen (6 rounds × 3 layers each), with relative error between 7e-8 and 1e-6, which is float32 rounding level and far under the 1e-4 tolerance. Its dequantizer matches MLX exactly for the 4-bit gate/up and 8-bit down projections. MLX's bf16 Metal output is within 0.08–0.74% of exact (cosine ≥ 0.99999). These kernels are a correctness harness (one warp per output) and are not timed, so we have no CUDA performance numbers yet.<br />
+<strong>7. Pre-pass truncation in mlx-lm</strong> (Granite target and draft, 7 drafts, 8 prompts × 256 tokens, first prompt as warm-up). Draft probabilities are uncalibrated and the cost table is the M5 Max one.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Configuration</th>
+<th style="text-align: left;">Tokens/s (median)</th>
+<th style="text-align: left;">Drafts made per round</th>
+<th style="text-align: left;">Verified per round</th>
+<th style="text-align: left;">Accepted per round</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Plain decoding</td>
+<td style="text-align: left;">115.8</td>
+<td style="text-align: left;">–</td>
+<td style="text-align: left;">–</td>
+<td style="text-align: left;">–</td>
+</tr>
+<tr>
+<td style="text-align: left;">Speculative, all drafts</td>
+<td style="text-align: left;">52.6</td>
+<td style="text-align: left;">6.95</td>
+<td style="text-align: left;">6.95</td>
+<td style="text-align: left;">2.89</td>
+</tr>
+<tr>
+<td style="text-align: left;">Cost-aware cut</td>
+<td style="text-align: left;">53.9</td>
+<td style="text-align: left;">6.96</td>
+<td style="text-align: left;">3.62</td>
+<td style="text-align: left;">2.29</td>
+</tr>
+<tr>
+<td style="text-align: left;">Early stop (τ = 0.1) + cut</td>
+<td style="text-align: left;">59.7</td>
+<td style="text-align: left;">5.62</td>
+<td style="text-align: left;">3.62</td>
+<td style="text-align: left;">2.29</td>
+</tr>
+</tbody>
+</table>
+<p>The gain comes mostly from drafting less, consistent with result 5: drafting dominates Granite's round.<br />
+<strong>8. Bit-identity of kept rows.</strong> The target runs an 8-row verify pass on a cached prefix, then the first k rows alone, and compares logits row by row.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Rows kept (k)</th>
+<th style="text-align: left;">Granite (bf16, 6 contexts)</th>
+<th style="text-align: left;">Qwen (bf16, 3 contexts)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">1</td>
+<td style="text-align: left;">Differs (up to 1.0 logit)</td>
+<td style="text-align: left;">Differs (up to 0.66 logit)</td>
+</tr>
+<tr>
+<td style="text-align: left;">2–4</td>
+<td style="text-align: left;">Identical</td>
+<td style="text-align: left;">Differs (up to 2.7 logits)</td>
+</tr>
+<tr>
+<td style="text-align: left;">5–7</td>
+<td style="text-align: left;">Identical</td>
+<td style="text-align: left;">Identical</td>
+</tr>
+<tr>
+<td style="text-align: left;">Same greedy token</td>
+<td style="text-align: left;">168/168 rows</td>
+<td style="text-align: left;">84/84 rows</td>
+</tr>
+</tbody>
+</table>
+<p>Repeating the full pass is always identical, so the differences come from batch shape, not run-to-run noise. In float32, Granite shows the same pattern at about 1e-5. The boundary is a kernel choice by row count, not mlx-lm's expert-sort switch: that switch happens at 8 rows, yet 5–7-row passes match the sorted 8-row pass exactly. A pre-pass cut always verifies at least 2 rows, so on Granite it is exactly bit-identical to verifying all drafts. On Qwen that holds only for cuts of at least 5 rows. Plain decoding is the 1-row path, which likely explains the divergence from greedy after about 38 tokens noted below.<br />
+<strong>9. Metal litmus tests</strong> (base M5, 32.8M instances per test, relaxed atomics, roles in different threadgroups, separate cache lines per location).</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Test</th>
+<th style="text-align: left;">Weak outcome</th>
+<th style="text-align: left;">Without fence</th>
+<th style="text-align: left;">With device-scope seq_cst fence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Message passing (MP)</td>
+<td style="text-align: left;">r0=1, r1=0</td>
+<td style="text-align: left;">0.59%</td>
+<td style="text-align: left;">0</td>
+</tr>
+<tr>
+<td style="text-align: left;">Store buffering (SB)</td>
+<td style="text-align: left;">r0=0, r1=0</td>
+<td style="text-align: left;">0.22%</td>
+<td style="text-align: left;">0</td>
+</tr>
+<tr>
+<td style="text-align: left;">Load buffering (LB)</td>
+<td style="text-align: left;">r0=1, r1=1</td>
+<td style="text-align: left;">0.46%</td>
+<td style="text-align: left;">0</td>
+</tr>
+<tr>
+<td style="text-align: left;">MP, payload as plain data</td>
+<td style="text-align: left;">r0=1, r1=0</td>
+<td style="text-align: left;">60.5%</td>
+<td style="text-align: left;">0</td>
+</tr>
+<tr>
+<td style="text-align: left;">MP, payload coherent(device)</td>
+<td style="text-align: left;">r0=1, r1=0</td>
+<td style="text-align: left;">64.5%</td>
+<td style="text-align: left;">0</td>
+</tr>
+</tbody>
+</table>
+<p>All three relaxed behaviors appear without a fence, and none of the 32.8M fenced runs per test were weak (95% upper bound below 1e-7). The coherent(device) qualifier alone does not order a handoff; the fence does. The fused kernel therefore pairs a device-scope fence with coherent(device) shared data, since plain data is not guaranteed coherent even where this test passed.</p>
+<p><strong>10. CUDA memory-consistency litmus tests (NCSA Delta A100, sm_80).</strong> Message passing, store buffering and load buffering between two thread blocks on different SMs, 2,048,000 trials per cell (1,024 instances × 2,000 iterations, 128 stress blocks). Variants: relaxed atomics, plain loads with stale data warmed into L1, a block-scope fence, a device-scope fence, and acquire/release atomics. Each cell counts the weak outcome.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Test (weak outcome)</th>
+<th style="text-align: left;">Relaxed</th>
+<th style="text-align: left;">Plain loads</th>
+<th style="text-align: left;">Block fence</th>
+<th style="text-align: left;">Device fence</th>
+<th style="text-align: left;">Acquire/release</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">MP (r0=1, r1=0)</td>
+<td style="text-align: left;">1</td>
+<td style="text-align: left;">309,821</td>
+<td style="text-align: left;">2</td>
+<td style="text-align: left;">0</td>
+<td style="text-align: left;">0</td>
+</tr>
+<tr>
+<td style="text-align: left;">SB (r0=0, r1=0)</td>
+<td style="text-align: left;">1,533</td>
+<td style="text-align: left;">2,027,952</td>
+<td style="text-align: left;">1,517</td>
+<td style="text-align: left;">0</td>
+<td style="text-align: left;">0</td>
+</tr>
+<tr>
+<td style="text-align: left;">LB (r0=1, r1=1)</td>
+<td style="text-align: left;">0</td>
+<td style="text-align: left;">0</td>
+<td style="text-align: left;">0</td>
+<td style="text-align: left;">0</td>
+<td style="text-align: left;">0</td>
+</tr>
+</tbody>
+</table>
+<p>Plain loads read stale data across blocks in 15% of MP trials and 99% of SB trials, because each SM's L1 cache is not coherent with the others. A block-scope fence gives the same weak outcomes as no fence, since it does not order accesses for another block; device-scope fences and acquire/release atomics removed every weak outcome. Unlike the M5, where LB appeared in 0.46% of runs, the A100 never showed LB, which the PTX model still allows. No trial timed out waiting for its partner block. Both GPUs therefore need device-scope ordering for a cross-block handoff.</p>
+<h2>6  Poster Plan</h2>
+<p>We will present one large printed poster, mostly figures with short explanatory text, and walk visitors through it in person; there is no live demo. Planned panels:</p>
+<blockquote>
+<ul>
+<li>Verify cost vs. rows: dense vs. MoE with stock MLX vs. MoE with our fused kernel.  </li>
+<li>Same-vs-distinct expert test (the per-pair cost).  </li>
+<li>Cut-policy comparison (the no-go result) on both models.  </li>
+<li>Synchronization-scheme overhead per layer.  </li>
+<li>Litmus-test outcome tables for Metal (M5) and CUDA (A100).  </li>
+<li>Diagram of the fused kernel's design and its two synchronization schemes.</li>
+</ul>
+</blockquote>
+<h2>7  Issues and Concerns</h2>
+<blockquote>
+<ul>
+<li><strong>The fused kernel is now the main deliverable, and it has not been started.</strong> Its value depends on actually streaming distinct experts near bandwidth. That is unproven on Metal, and the kernel must handle mixed 4/8-bit weights. The global-barrier version keeps every threadgroup resident at once, but Metal does not guarantee concurrent forward progress, so it must launch no more threadgroups than the GPU can hold at once or it can deadlock. The per-tile-flag version avoids that. This kernel is the project's one real unknown; the remaining work is implementation and measurement.  </li>
+<li><strong>Bit-identity under bf16.</strong> MLX's verify pass does not reproduce single-token decoding exactly: outputs diverged from greedy after a median of about 38 tokens on Granite. Our bit-identity test (result 8) traces this to kernel choice by row count: kept rows match the full verify pass for any pre-pass cut on Granite, but on Qwen only for cuts of at least 5 rows. The claim is therefore stated per model and row count.  </li>
+<li><strong>Speculative decoding does not pay off yet</strong> on either model with stock kernels. Granite's smallest draft model is too expensive, and Qwen's acceptance is low.  </li>
+<li><strong>Cost model:</strong> a linear fit is good for Granite (R² = 0.996) but weaker for Qwen (0.81), because mlx-lm switches to sorted expert IDs at 8 rows (8 × top-8 = 64 pairs). We report the measured cost tables as primary.  </li>
+<li><strong>The mlx-lm pre-pass rule</strong> uses uncalibrated draft probabilities and the M5 Max cost table, and its timings so far come from the base M5.  </li>
+<li><strong>Memory traffic is modeled</strong> from bytes read, not measured with hardware counters.  </li>
+<li><strong>Compute access:</strong> resolved. Bridges-2 is offline, so CUDA work runs on NCSA Delta (100 GPU-hour allocation).</li>
+</ul>
+</blockquote>
+<h2></h2>
+<h2>8  Revised Schedule</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Dates</th>
+<th style="text-align: left;">Milestones</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Mon Nov 23 – Wed Nov 25</td>
+<td style="text-align: left;">Milestone report, due Nov 23 (both). CUDA replay and litmus tests on a Delta A100, done Nov 23 (Aanya). Confirm the bf16 divergence on Qwen (Aanya). Global-barrier fused kernel (elected producer, coherent task table, tile queue) correct on one Granite layer against the float32 reference (Anya).</td>
+</tr>
+<tr>
+<td style="text-align: left;">Thu Nov 26 – Sun Nov 29 (Thanksgiving, lighter)</td>
+<td style="text-align: left;">Benchmark harness for the fused kernel: correctness against the trace's float32 reference and timing against gather_qmm at 1–8 rows on both models (Aanya). Mixed 4/8-bit weights and the per-tile-flag variant, timed at 1–8 rows with the harness (Anya).</td>
+</tr>
+<tr>
+<td style="text-align: left;">Mon Nov 30 – Wed Dec 2</td>
+<td style="text-align: left;">Fused kernel as an MLX extension op inside mlx-lm's MoE layer (Anya), integrated into the speculative decoding loop with a new verify cost table (Aanya). Litmus tests and Qwen bit-identity on the M5 Max (Anya).</td>
+</tr>
+<tr>
+<td style="text-align: left;">Thu Dec 3 – Sun Dec 6</td>
+<td style="text-align: left;">End-to-end evaluation: tokens/s with pre-pass truncation, fused vs. stock kernel, both models (both). Per-layer synchronization overhead for both schemes (Anya). Stretch: CUDA comparison on Delta (Aanya).</td>
+</tr>
+<tr>
+<td style="text-align: left;">Mon Dec 7 – Wed Dec 9</td>
+<td style="text-align: left;">Figures and final report (both), including sections on synchronization, litmus tests and the kernel (Anya).</td>
+</tr>
+<tr>
+<td style="text-align: left;">Thu Dec 10 – Fri Dec 11</td>
+<td style="text-align: left;">Final report due Dec 10; poster session Dec 11, 5:30–8:30pm (both).</td>
+</tr>
+</tbody>
+</table>
+</body>
+</html>
